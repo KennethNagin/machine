@@ -38,6 +38,10 @@ type Driver struct {
 	SecurityGroups   []string
 	FloatingIpPool   string
 	FloatingIpPoolId string
+	VolumeName       string
+	VolumeDeviceName string
+	VolumeId         string
+	VolumeSize       int
 	client           Client
 }
 
@@ -164,6 +168,27 @@ func GetCreateFlags() []cli.Flag {
 			Usage: "OpenStack SSH port",
 			Value: 22,
 		},
+		cli.StringFlag{
+			Name:  "openstack-volume-name",
+			Usage: "OpenStack volume name to use when creating volume instance; it will default to docker-machine-name",
+			Value: "",
+		},
+		cli.StringFlag{
+			Name:  "openstack-volume-device-name",
+			Usage: "OpenStack volume device name to use when attaching the volume to the host; it will default to /dev/vdb",
+			Value: "",
+		},
+
+		cli.StringFlag{
+			Name:  "openstack-volume-id",
+			Usage: "OpenStack volume id assigned to a volume instance",
+			Value: "",
+		},
+		cli.IntFlag{
+			Name:  "openstack-volume-size",
+			Usage: "OpenStack volume size in in gibibytes (GiB) to use when creating a volume instance",
+			Value: 0,
+		},
 	}
 }
 
@@ -218,7 +243,10 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	d.SwarmMaster = flags.Bool("swarm-master")
 	d.SwarmHost = flags.String("swarm-host")
 	d.SwarmDiscovery = flags.String("swarm-discovery")
-
+	d.VolumeName = flags.String("openstack-volume-name")
+	d.VolumeDeviceName = flags.String("openstack-volume-device-name")
+	d.VolumeId = flags.String("openstack-volume-id")
+	d.VolumeSize = flags.Int("openstack-volume-size")
 	return d.checkConfig()
 }
 
@@ -311,11 +339,24 @@ func (d *Driver) Create() error {
 	if err := d.createSSHKey(); err != nil {
 		return err
 	}
+	if d.VolumeSize > 0 {
+	  if err := d.volumeCreate(); err != nil {
+	    	return err
+	  }
+	}
 	if err := d.createMachine(); err != nil {
 		return err
 	}
 	if err := d.waitForInstanceActive(); err != nil {
 		return err
+	}
+	if d.VolumeId != "" {
+		if err := d.waitForVolumeAvailable(); err != nil {
+			return err
+		}
+	  	if err := d.volumeAttach(); err != nil {
+	    		return err
+	  	}
 	}
 	if d.FloatingIpPool != "" {
 		if err := d.assignFloatingIp(); err != nil {
@@ -539,6 +580,17 @@ func (d *Driver) initNetwork() error {
 	return nil
 }
 
+func (d *Driver) initBlockStorage() error {
+	if err := d.client.Authenticate(d); err != nil {
+		return err
+	}
+	if err := d.client.InitBlockStorageClient(d); err != nil {
+		return err
+	}
+	return nil
+}
+
+
 func (d *Driver) createSSHKey() error {
 	log.WithField("Name", d.KeyPairName).Debug("Creating Key Pair...")
 	if err := ssh.GenerateSSHKey(d.GetSSHKeyPath()); err != nil {
@@ -574,6 +626,59 @@ func (d *Driver) createMachine() error {
 	d.MachineId = instanceId
 	return nil
 }
+
+func (d *Driver) volumeCreate() error {
+	if d.VolumeName == "" {
+		d.VolumeName = "docker-machine-volume"
+	}
+	log.WithFields(log.Fields{
+		"VolumeName": d.VolumeName,
+		"VolumeSize": d.VolumeSize,
+	}).Debug("Creating OpenStack Volume ...")
+
+	if err := d.initBlockStorage(); err != nil {
+		return err
+	}
+	volumeId, err := d.client.VolumeCreate(d)
+	if err != nil {
+		return err
+	}
+	d.VolumeId = volumeId
+	return nil
+}
+
+func (d *Driver) waitForVolumeAvailable() error {
+	log.WithFields(log.Fields{
+		"VolumeId": d.VolumeId,
+	}).Debug("Waiting for the OpenStack volume to be available...")
+	if err := d.initBlockStorage(); err != nil {
+		return err
+	}	
+	if err := d.client.WaitForVolumeStatus(d, "available"); err != nil {
+		return err
+	}
+	fmt.Printf("returned from  d.client.WaitForVolumeStatus\n")
+	return nil
+}
+
+
+func (d *Driver) volumeAttach() error {
+	log.WithFields(log.Fields{
+		"VolumeId": d.VolumeId,
+		"VolumeDeviceName": d.VolumeDeviceName,
+	}).Debug("Attaching OpenStack Volume ...")
+	if err := d.initCompute(); err != nil {
+		return err
+	}
+	volumeDeviceName,err := d.client.VolumeAttach(d)
+	if err != nil {
+		return err
+	}
+	d.VolumeDeviceName = volumeDeviceName
+	return nil
+}
+
+
 
 func (d *Driver) assignFloatingIp() error {
 
